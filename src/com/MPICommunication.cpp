@@ -41,6 +41,15 @@ MPI_Datatype MPI_Select_unsigned_integer_datatype<8>::datatype = MPI_UNSIGNED_LO
 namespace precice::com {
 MPICommunication::MPICommunication() = default;
 
+MPICommunication::~MPICommunication()
+{
+  // 如果创建了本地通信器，销毁它以释放资源
+  if (_localComm != MPI_COMM_NULL) {
+    MPI_Comm_free(&_localComm);
+    _localComm = MPI_COMM_NULL;
+  }
+}
+
 void MPICommunication::send(std::string const &itemToSend, Rank rankReceiver)
 {
   PRECICE_TRACE(itemToSend, rankReceiver);
@@ -327,6 +336,59 @@ PtrRequest MPICommunication::aReceive(bool &itemToReceive, Rank rankSender)
             &request);
 
   return PtrRequest(new MPIRequest(request));
+}
+
+// ----------------------------------------------------------------
+// [新增代码] 拓扑感知具体实现
+// ----------------------------------------------------------------
+
+void MPICommunication::splitCommunicatorByNode(MPI_Comm globalComm)
+{
+  // 防止重复初始化
+  if (_localComm != MPI_COMM_NULL) {
+    return;
+  }
+
+  // MPI_COMM_TYPE_SHARED 是 MPI-3 标准引入的
+  // 它会将 globalComm 分裂，使得共享同一块内存（即同一物理节点）的进程进入同一个子通信器
+  // key=0 表示我们希望保持原有的 Rank 相对顺序
+  int mpiResult = MPI_Comm_split_type(globalComm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &_localComm);
+
+  if (mpiResult != MPI_SUCCESS) {
+    PRECICE_ERROR("Failed to split MPI communicator for shared memory topology discovery.");
+    return;
+  }
+
+  // 获取在节点内部的 Rank 和 Size
+  MPI_Comm_rank(_localComm, &_localRank);
+  MPI_Comm_size(_localComm, &_localSize);
+
+  PRECICE_DEBUG("Topology Discovery: Local Rank = {}, Local Size = {} on this physical node.", _localRank, _localSize);
+
+  if (isLocalRank0()) {
+    PRECICE_DEBUG("I am the Proxy Agent (Local Rank 0) for this node.");
+  }
+}
+
+int MPICommunication::getLocalRank() const
+{
+  return _localRank;
+}
+
+int MPICommunication::getLocalSize() const
+{
+  return _localSize;
+}
+
+bool MPICommunication::isLocalRank0() const
+{
+  // 约定：节点内的第 0 号进程作为代理
+  return _localRank == 0;
+}
+
+MPI_Comm MPICommunication::getLocalCommunicator() const
+{
+  return _localComm;
 }
 
 } // namespace precice::com

@@ -22,7 +22,7 @@ public:
   MPICommunication();
 
   /// Destructor, empty.
-  ~MPICommunication() override = default;
+  ~MPICommunication() override;
 
   /**
    * @brief Sends a std::string to process with given rank.
@@ -119,11 +119,53 @@ public:
   /// Asynchronously receives a bool from process with given rank.
   PtrRequest aReceive(bool &itemToReceive, Rank rankSender) override;
 
+  // ----------------------------------------------------------------
+  // [新增代码] 拓扑感知相关接口
+  // ----------------------------------------------------------------
+
+  /**
+   * @brief 基于物理节点分裂通信器
+   * * 利用 MPI_Comm_split_type 将全局通信器分裂为多个节点内通信器。
+   * 同一个物理节点上的进程将位于同一个 _localComm 中。
+   *
+   * @param globalComm 原始的父通信器（通常包含所有相关进程）
+   */
+  void splitCommunicatorByNode(MPI_Comm globalComm);
+
+  /**
+   * @brief 获取当前进程在本地节点上的 Rank (Local Rank)
+   * * @return int 0 到 localSize-1
+   */
+  int getLocalRank() const;
+
+  /**
+   * @brief 获取本地节点上的进程总数
+   */
+  int getLocalSize() const;
+
+  /**
+   * @brief 判断当前进程是否为本地节点的“代理进程” (Proxy)
+   * * 通常我们将 Local Rank 0 选为代理，负责跨节点通信或管理共享内存。
+   */
+  bool isLocalRank0() const;
+
+  /**
+   * @brief 获取节点内通信器句柄
+   */
+  MPI_Comm getLocalCommunicator() const;
+
 protected:
   /// Returns the communicator.
   virtual MPI_Comm &communicator(Rank rank) = 0;
 
   virtual Rank rank(int rank) = 0;
+
+  // ----------------------------------------------------------------
+  // [新增代码] 拓扑数据成员
+  // ----------------------------------------------------------------
+  MPI_Comm _localComm = MPI_COMM_NULL; // 节点内通信器
+  int      _localRank = -1;            // 节点内编号
+  int      _localSize = -1;            // 节点内进程数
 
 private:
   logging::Logger _log{"com::MPICommunication"};
