@@ -154,6 +154,38 @@ public:
    */
   MPI_Comm getLocalCommunicator() const;
 
+  // ----------------------------------------------------------------
+  // [新增代码] 共享内存管理接口 (第二步)
+  // ----------------------------------------------------------------
+
+  /**
+   * @brief 在节点内分配共享内存窗口
+   * * @param bytes 要分配的字节数。
+   * 注意：通常只有代理进程 (LocalRank 0) 需要传入实际大小（作为缓冲区），
+   * 普通进程传入 0 即可（它们不提供内存，只访问代理的内存）。
+   */
+  void allocateSharedMemoryWindow(MPI_Aint bytes);
+
+  /**
+   * @brief 获取指定本地进程的共享内存起始指针
+   * * 利用 MPI_Win_shared_query 获取同节点其他进程的内存地址。
+   * * @param targetLocalRank 目标进程在 _localComm 中的 Rank (默认 0，即获取代理进程的地址)
+   * @return void* 指向共享内存的裸指针
+   */
+  void* getSharedMemoryPointer(int targetLocalRank = 0);
+
+  /**
+   * @brief 释放共享内存窗口资源
+   */
+  void freeSharedMemoryWindow();
+
+  /**
+   * @brief 节点内同步屏障
+   * * 仅在 _localComm 上执行 Barrier，比全局 Barrier 快得多。
+   * 用于确保内存写入完成后，其他进程再开始读取。
+   */
+  void sharedMemoryBarrier();
+
 protected:
   /// Returns the communicator.
   virtual MPI_Comm &communicator(Rank rank) = 0;
@@ -166,6 +198,15 @@ protected:
   MPI_Comm _localComm = MPI_COMM_NULL; // 节点内通信器
   int      _localRank = -1;            // 节点内编号
   int      _localSize = -1;            // 节点内进程数
+
+  // ----------------------------------------------------------------
+  // [新增代码] 共享内存成员变量
+  // ----------------------------------------------------------------
+  MPI_Win _sharedWin = MPI_WIN_NULL; // 共享内存窗口句柄
+  void* _sharedBasePtr = nullptr;  // 本进程贡献的内存段起始地址 (My Segment)
+
+  // 缓存代理进程 (Local Rank 0) 的内存地址，避免重复查询
+  void* _proxySharedPtr = nullptr;
 
 private:
   logging::Logger _log{"com::MPICommunication"};
