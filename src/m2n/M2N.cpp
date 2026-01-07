@@ -12,6 +12,7 @@
 #include "profiling/Event.hpp"
 #include "utils/IntraComm.hpp"
 #include "utils/assertion.hpp"
+#include "m2n/HierarchicalCommunication.hpp"
 
 using precice::profiling::Event;
 
@@ -20,11 +21,12 @@ extern bool syncMode;
 
 namespace m2n {
 
-M2N::M2N(com::PtrCommunication interComm, DistributedComFactory::SharedPointer distrFactory, bool useOnlyPrimaryCom, bool useTwoLevelInit)
+M2N::M2N(com::PtrCommunication interComm, DistributedComFactory::SharedPointer distrFactory, bool useOnlyPrimaryCom, bool useTwoLevelInit, bool useHierarchical)
     : _interComm(std::move(interComm)),
       _distrFactory(std::move(distrFactory)),
       _useOnlyPrimaryCom(useOnlyPrimaryCom),
-      _useTwoLevelInit(useTwoLevelInit)
+      _useTwoLevelInit(useTwoLevelInit),
+      _useHierarchical(useHierarchical)
 {
 }
 
@@ -257,7 +259,13 @@ void M2N::createDistributedCommunication(const mesh::PtrMesh &mesh)
 {
   PRECICE_TRACE();
   PRECICE_ASSERT(not _useOnlyPrimaryCom);
-  _distComs[mesh->getID()] = _distrFactory->newDistributedCommunication(mesh);
+  if (_useHierarchical) {
+    auto commFactory = _distrFactory->communicationFactory();
+    _distComs[mesh->getID()] = std::make_shared<HierarchicalCommunication>(commFactory, mesh);
+    PRECICE_INFO("Using HierarchicalCommunication (Innovation 2) for mesh \"{}\"", mesh->getName());
+  } else {
+    _distComs[mesh->getID()] = _distrFactory->newDistributedCommunication(mesh);
+  }
 }
 
 void M2N::send(

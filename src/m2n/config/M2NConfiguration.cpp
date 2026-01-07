@@ -93,6 +93,10 @@ M2NConfiguration::M2NConfiguration(xml::XMLTag &parent)
   attrTwoLevel.setDocumentation("Use a two-level initialization scheme. "
                                 "Recommended for large parallel runs (>5000 MPI ranks).");
 
+  XMLAttribute<bool> attrHierarchical(ATTR_USE_HIERARCHICAL, false);
+  attrHierarchical.setDocumentation("Enable the hierarchical communication aggregation mechanism (Innovation 2). "
+                                    "Requires MPI.");
+
   auto attrFrom = XMLAttribute<std::string>("acceptor")
                       .setDocumentation(
                           "First participant name involved in communication. For performance reasons, we recommend to use "
@@ -105,6 +109,7 @@ M2NConfiguration::M2NConfiguration(xml::XMLTag &parent)
     tag.addAttribute(attrTo);
     tag.addAttribute(attrEnforce);
     tag.addAttribute(attrTwoLevel);
+    tag.addAttribute(attrHierarchical);
     parent.addSubtag(tag);
   }
 }
@@ -136,6 +141,7 @@ void M2NConfiguration::xmlTagCallback(const xml::ConfigurationContext &context, 
     checkDuplicates(acceptor, connector);
     bool enforceGatherScatter = tag.getBooleanAttributeValue(ATTR_ENFORCE_GATHER_SCATTER);
     bool useTwoLevelInit      = tag.getBooleanAttributeValue(ATTR_USE_TWO_LEVEL_INIT);
+    bool useHierarchical      = tag.getBooleanAttributeValue(ATTR_USE_HIERARCHICAL);
 
     if (enforceGatherScatter && useTwoLevelInit) {
       throw std::runtime_error{std::string{"A gather-scatter m2n communication cannot use two-level initialization. Please switch either "} + "\"" + ATTR_ENFORCE_GATHER_SCATTER + "\" or \"" + ATTR_USE_TWO_LEVEL_INIT + "\" off."};
@@ -198,7 +204,7 @@ void M2NConfiguration::xmlTagCallback(const xml::ConfigurationContext &context, 
     PRECICE_ASSERT(distrFactory.get() != nullptr);
 
     _m2ns.emplace_back(ConfiguredM2N{
-        std::make_shared<m2n::M2N>(com, distrFactory, false, useTwoLevelInit),
+        std::make_shared<m2n::M2N>(com, distrFactory, false, useTwoLevelInit, useHierarchical),
         acceptor,
         connector});
   }

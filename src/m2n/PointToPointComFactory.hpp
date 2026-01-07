@@ -14,7 +14,7 @@ public:
 
   DistributedCommunication::SharedPointer newDistributedCommunication(
       mesh::PtrMesh mesh) override;
-
+  com::PtrCommunicationFactory communicationFactory() override;
 private:
   /// communication factory for 1:M communications
   com::PtrCommunicationFactory _comFactory;
