@@ -14,6 +14,8 @@
 #include "mesh/SharedPointer.hpp"
 #include "m2n/SharedMemoryHeader.hpp"
 #include "com/MPICommunication.hpp"
+#include <map>
+#include <mpi.h>
 
 namespace precice {
 namespace com {
@@ -193,8 +195,6 @@ private:
   int  _localRank = -1;
   int  _localSize = -1;
 
-  // [新增] 辅助函数声明
-  void prepareSharedMemory(size_t payloadSize);
 
   std::pair<long, long> computeLayout(long myItemCount, MPI_Comm localComm);
 

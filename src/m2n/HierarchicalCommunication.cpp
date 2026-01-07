@@ -625,9 +625,6 @@ void HierarchicalCommunication::closeConnection()
 void HierarchicalCommunication::send(precice::span<double const> itemsToSend, int valueDimension)
 {
 
-  if (_mappings.empty() || itemsToSend.empty()) {
-    return;
-  }
 
   auto mpiCom = std::dynamic_pointer_cast<com::MPICommunication>(_communication);
   PRECICE_ASSERT(mpiCom, "Hierarchical communication requires MPI.");
@@ -815,10 +812,7 @@ void HierarchicalCommunication::send(precice::span<double const> itemsToSend, in
 
 void HierarchicalCommunication::receive(precice::span<double> itemsToReceive, int valueDimension)
 {
-  // 1. 基础检查与初始化
-  if (_mappings.empty() && itemsToReceive.empty()) {
-    return;
-  }
+
 
   // 按照原版逻辑，先清零缓冲区（因为后面是 += 操作）
   std::fill(itemsToReceive.begin(), itemsToReceive.end(), 0.0);
