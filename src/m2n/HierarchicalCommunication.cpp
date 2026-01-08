@@ -320,17 +320,6 @@ HierarchicalCommunication::HierarchicalCommunication(com::PtrCommunicationFactor
     : DistributedCommunication(mesh),
       _communicationFactory(std::move(communicationFactory))
 {
-  // 1. 创建底层的 MPI 通信对象
-  _communication = _communicationFactory->newCommunication();
-
-  // 2. [新增] 预先进行拓扑感知
-  // 注意：此时可能连接还没建立，但我们可以先获取 MPI 对象指针
-  auto mpiCom = std::dynamic_pointer_cast<com::MPICommunication>(_communication);
-  if (mpiCom) {
-    // 标记一下，实际的分裂操作建议延迟到 send/receive 或连接建立后进行
-    // 因为那时候 MPI_COMM_WORLD 才确定可用
-    PRECICE_DEBUG("HierarchicalCommunication created. Topology discovery will be lazy-loaded.");
-  }
 }
 
 HierarchicalCommunication::~HierarchicalCommunication()
