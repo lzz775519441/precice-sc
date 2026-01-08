@@ -14,6 +14,5 @@ public:
 
   virtual DistributedCommunication::SharedPointer newDistributedCommunication(
       mesh::PtrMesh mesh) = 0;
-  virtual com::PtrCommunicationFactory communicationFactory() = 0;
 };
 } // namespace precice::m2n

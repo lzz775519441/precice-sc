@@ -7,15 +7,15 @@
 
 namespace precice::m2n {
 
-class PointToPointComFactory : public DistributedComFactory {
+class HierarchicalComFactory : public DistributedComFactory {
 
 public:
-  explicit PointToPointComFactory(com::PtrCommunicationFactory comFactory);
+  explicit HierarchicalComFactory(com::PtrCommunicationFactory communicationFactory);
 
   DistributedCommunication::SharedPointer newDistributedCommunication(
       mesh::PtrMesh mesh) override;
+
 private:
-  /// communication factory for 1:M communications
   com::PtrCommunicationFactory _comFactory;
 };
 

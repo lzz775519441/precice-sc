@@ -259,13 +259,7 @@ void M2N::createDistributedCommunication(const mesh::PtrMesh &mesh)
 {
   PRECICE_TRACE();
   PRECICE_ASSERT(not _useOnlyPrimaryCom);
-  if (_useHierarchical) {
-    auto commFactory = _distrFactory->communicationFactory();
-    _distComs[mesh->getID()] = std::make_shared<HierarchicalCommunication>(commFactory, mesh);
-    PRECICE_INFO("Using HierarchicalCommunication (Innovation 2) for mesh \"{}\"", mesh->getName());
-  } else {
-    _distComs[mesh->getID()] = _distrFactory->newDistributedCommunication(mesh);
-  }
+  _distComs[mesh->getID()] = _distrFactory->newDistributedCommunication(mesh);
 }
 
 void M2N::send(

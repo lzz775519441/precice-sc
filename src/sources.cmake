@@ -169,6 +169,8 @@ target_sources(preciceCore
     src/m2n/PointToPointComFactory.hpp
     src/m2n/PointToPointCommunication.cpp
     src/m2n/PointToPointCommunication.hpp
+    src/m2n/HierarchicalComFactory.cpp
+    src/m2n/HierarchicalComFactory.hpp
     src/m2n/HierarchicalCommunication.cpp
     src/m2n/HierarchicalCommunication.hpp
     src/m2n/SharedPointer.hpp

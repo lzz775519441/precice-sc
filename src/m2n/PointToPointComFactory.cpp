@@ -17,9 +17,5 @@ PointToPointComFactory::newDistributedCommunication(mesh::PtrMesh mesh)
   return DistributedCommunication::SharedPointer(new PointToPointCommunication(_comFactory, mesh));
 }
 
-com::PtrCommunicationFactory PointToPointComFactory::communicationFactory()
-{
-  return _comFactory;
-}
 
 } // namespace precice::m2n

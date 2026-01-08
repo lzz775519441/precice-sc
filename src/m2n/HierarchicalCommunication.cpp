@@ -34,6 +34,7 @@ using precice::profiling::Event;
 
 namespace precice::m2n {
 
+namespace impl {
 void send(mesh::Mesh::VertexDistribution const &m,
           int                                   rankReceiver,
           const com::PtrCommunication          &communication)
@@ -95,10 +96,10 @@ void broadcast(mesh::Mesh::VertexDistribution &m)
 {
   if (utils::IntraComm::isPrimary()) {
     // Broadcast (send) vertex distributions.
-    m2n::broadcastSend(m);
+    m2n::impl::broadcastSend(m);
   } else if (utils::IntraComm::isSecondary()) {
     // Broadcast (receive) vertex distributions.
-    m2n::broadcastReceive(m, 0);
+    m2n::impl::broadcastReceive(m, 0);
   }
 }
 
@@ -309,6 +310,10 @@ std::map<int, std::vector<int>> buildCommunicationMap(
   }
   return communicationMap;
 }
+
+}
+
+using namespace impl;
 
 HierarchicalCommunication::HierarchicalCommunication(com::PtrCommunicationFactory communicationFactory,
                                                      mesh::PtrMesh                mesh)
@@ -641,7 +646,6 @@ void HierarchicalCommunication::send(precice::span<double const> itemsToSend, in
   }
 
   MPI_Comm localComm = mpiCom->getLocalCommunicator();
-  int localRank = mpiCom->getLocalRank();
   int localSize = mpiCom->getLocalSize();
   int myGlobalRank = utils::IntraComm::getRank(); // 用于确定性排序
 
@@ -813,7 +817,6 @@ void HierarchicalCommunication::send(precice::span<double const> itemsToSend, in
 void HierarchicalCommunication::receive(precice::span<double> itemsToReceive, int valueDimension)
 {
 
-
   // 按照原版逻辑，先清零缓冲区（因为后面是 += 操作）
   std::fill(itemsToReceive.begin(), itemsToReceive.end(), 0.0);
 
@@ -833,7 +836,6 @@ void HierarchicalCommunication::receive(precice::span<double> itemsToReceive, in
   }
 
   MPI_Comm localComm = mpiCom->getLocalCommunicator();
-  int localRank = mpiCom->getLocalRank();
   int localSize = mpiCom->getLocalSize();
   int myGlobalRank = utils::IntraComm::getRank();
 

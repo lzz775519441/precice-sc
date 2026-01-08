@@ -10,6 +10,7 @@
 #include "logging/LogMacros.hpp"
 #include "m2n/DistributedComFactory.hpp"
 #include "m2n/GatherScatterComFactory.hpp"
+#include "m2n/HierarchicalComFactory.hpp"
 #include "m2n/M2N.hpp"
 #include "m2n/PointToPointComFactory.hpp"
 #include "utils/Helpers.hpp"
@@ -198,6 +199,8 @@ void M2NConfiguration::xmlTagCallback(const xml::ConfigurationContext &context, 
     DistributedComFactory::SharedPointer distrFactory;
     if (enforceGatherScatter) {
       distrFactory = std::make_shared<GatherScatterComFactory>(com);
+    } else if (useHierarchical) {
+      distrFactory = std::make_shared<HierarchicalComFactory>(comFactory);
     } else {
       distrFactory = std::make_shared<PointToPointComFactory>(comFactory);
     }
