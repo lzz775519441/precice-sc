@@ -195,9 +195,6 @@ private:
   int  _localRank = -1;
   int  _localSize = -1;
 
-
-  std::pair<long, long> computeLayout(long myItemCount, MPI_Comm localComm);
-
   // 路由表：远程 Rank -> 远程 Proxy Rank
   std::map<int, int> _remoteRankToProxy;
 
@@ -205,10 +202,47 @@ private:
   void exchangeTopology();
 
   std::vector<com::PtrRequest> _ongoingRequests;
-
   void cleanupRequests();
-
   void waitAllOngoingRequests();
+
+  // 定义任务结构体 (Send/Recv 通用)
+  struct ProxyTask {
+    int targetRank;    // 对方的 Rank
+    long shmOffset;    // 在对应 Window 中的偏移量
+    long totalDoubles; // 数据量
+  };
+
+  struct WorkerTask {
+    double* shmPtr;        // 绝对地址
+    const int* indicesPtr; // 映射索引
+    size_t count;          // 数量
+  };
+
+  // ---------------------------------------------------------
+  // 1. 发送端专用 (SEND Resource)
+  // ---------------------------------------------------------
+  int     _cachedSendDim = 0;       // 记录当前的 Send 维度
+  MPI_Win _winSend = MPI_WIN_NULL;  // 发送专用 MPI Window
+  char* _sendBasePtr = nullptr;   // 发送内存基地址
+
+  std::vector<ProxyTask>  _proxySendTasks;
+  std::vector<WorkerTask> _workerSendTasks;
+
+  void initializeSendPattern(int valueDimension);
+  void freeSendWindow();
+
+  // ---------------------------------------------------------
+  // 2. 接收端专用 (RECEIVE Resource)
+  // ---------------------------------------------------------
+  int     _cachedRecvDim = 0;       // 记录当前的 Recv 维度
+  MPI_Win _winRecv = MPI_WIN_NULL;  // 接收专用 MPI Window
+  char* _recvBasePtr = nullptr;   // 接收内存基地址
+
+  std::vector<ProxyTask>  _proxyRecvTasks;
+  std::vector<WorkerTask> _workerRecvTasks;
+
+  void initializeRecvPattern(int valueDimension);
+  void freeRecvWindow();
 };
 } // namespace m2n
 } // namespace precice

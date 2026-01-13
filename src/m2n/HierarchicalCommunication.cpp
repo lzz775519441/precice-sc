@@ -325,6 +325,9 @@ HierarchicalCommunication::HierarchicalCommunication(com::PtrCommunicationFactor
 HierarchicalCommunication::~HierarchicalCommunication()
 {
   PRECICE_TRACE(_isConnected);
+  waitAllOngoingRequests();
+  freeSendWindow();
+  freeRecvWindow();
   closeConnection();
 }
 
@@ -608,6 +611,7 @@ void HierarchicalCommunication::closeConnection()
   if (not isConnected())
     return;
 
+  waitAllOngoingRequests();
   checkBufferedRequests(true);
 
   _communication.reset();
@@ -618,389 +622,86 @@ void HierarchicalCommunication::closeConnection()
 
 void HierarchicalCommunication::send(precice::span<double const> itemsToSend, int valueDimension)
 {
-
-
   auto mpiCom = std::dynamic_pointer_cast<com::MPICommunication>(_communication);
   PRECICE_ASSERT(mpiCom, "Hierarchical communication requires MPI.");
 
-  // 确保上一轮的异步发送已彻底完成
   if (_isProxy) {
     waitAllOngoingRequests();
   }
   mpiCom->sharedMemoryBarrier();
 
-  // 0. 确保路由表已建立
-  if (_remoteRankToProxy.empty()) {
-    exchangeTopology();
+  if (valueDimension != _cachedSendDim) {
+      initializeSendPattern(valueDimension);
   }
 
-  MPI_Comm localComm = mpiCom->getLocalCommunicator();
-  int localSize = mpiCom->getLocalSize();
-  int myGlobalRank = utils::IntraComm::getRank(); // 用于确定性排序
-
-  // ===========================================================================
-  // 步骤一：元数据申报 (Manifest)
-  // ===========================================================================
-  // 我们需要收集：[TargetProxy, RemoteRank, SourceRank, Bytes]
-  // 使用 flat vector 存储以便 MPI 传输
-  std::vector<long> myMeta;
-
-  for (const auto &mapping : _mappings) {
-    if (_remoteRankToProxy.find(mapping.remoteRank) == _remoteRankToProxy.end()) {
-        continue;
-    }
-
-    long targetProxy = static_cast<long>(_remoteRankToProxy[mapping.remoteRank]);
-    long remoteRank  = static_cast<long>(mapping.remoteRank);
-    long sourceRank  = static_cast<long>(myGlobalRank);
-    long bytes       = static_cast<long>(mapping.indices.size() * valueDimension * sizeof(double));
-
-    if (bytes > 0) {
-      myMeta.push_back(targetProxy);
-      myMeta.push_back(remoteRank);
-      myMeta.push_back(sourceRank);
-      myMeta.push_back(bytes);
-    }
-  }
-
-  // ===========================================================================
-  // 步骤二：全局交换 (Allgatherv)
-  // ===========================================================================
-  // 1. 收集每个进程的元数据数量
-  std::vector<int> metaCounts(localSize);
-  int myMetaSize = static_cast<int>(myMeta.size());
-  MPI_Allgather(&myMetaSize, 1, MPI_INT, metaCounts.data(), 1, MPI_INT, localComm);
-
-  // 2. 准备接收缓冲区
-  std::vector<int> metaDispls(localSize + 1, 0);
-  for (int i = 0; i < localSize; ++i) {
-    metaDispls[i + 1] = metaDispls[i] + metaCounts[i];
-  }
-  std::vector<long> globalMeta(metaDispls.back());
-
-  // 3. 收集所有元数据
-  // 注意：这里用 MPI_LONG，确保 long 是 64 位或者与 MPI_LONG 匹配
-  MPI_Allgatherv(myMeta.data(), myMetaSize, MPI_LONG,
-                 globalMeta.data(), metaCounts.data(), metaDispls.data(), MPI_LONG,
-                 localComm);
-
-  // ===========================================================================
-  // 步骤三：排序与调度 (Sort & Schedule)
-  // ===========================================================================
-  // 1. 反序列化为结构体以便排序
-  struct RequestEntry {
-    long targetProxy;
-    long remoteRank;
-    long sourceRank;
-    long bytes;
-    long globalOffset; // 计算后回填
-  };
-
-  std::vector<RequestEntry> allRequests;
-  allRequests.reserve(globalMeta.size() / 4);
-
-  for (size_t i = 0; i < globalMeta.size(); i += 4) {
-    allRequests.push_back({
-      globalMeta[i],     // target
-      globalMeta[i+1],   // remote
-      globalMeta[i+2],   // source
-      globalMeta[i+3],   // bytes
-      0                  // offset (placeholder)
-    });
-  }
-
-  // 2. [关键] 确定性排序
-  // 优先级：TargetProxy -> RemoteRank -> SourceRank
-  std::sort(allRequests.begin(), allRequests.end(),
-    [](const RequestEntry &a, const RequestEntry &b) {
-      if (a.targetProxy != b.targetProxy) return a.targetProxy < b.targetProxy;
-      if (a.remoteRank != b.remoteRank)   return a.remoteRank < b.remoteRank;
-      return a.sourceRank < b.sourceRank;
-    });
-
-  // 3. 计算内存偏移量 (Memory Layout) & 代理发送计划
-  long currentShmOffset = sizeof(SharedMemoryHeader);
-
-  // 用于 Proxy 的发送计划：TargetProxy -> {StartOffset, TotalBytes}
-  struct SendBatch { long startOffset; long totalBytes; };
-  std::map<long, SendBatch> sendSchedule;
-
-  for (auto &req : allRequests) {
-    req.globalOffset = currentShmOffset; // 记录这条请求的写入位置
-
-    // 更新发送计划 (利用已排序特性，相同 Target 是连续的)
-    if (sendSchedule.find(req.targetProxy) == sendSchedule.end()) {
-        sendSchedule[req.targetProxy] = {currentShmOffset, 0};
-    }
-    sendSchedule[req.targetProxy].totalBytes += req.bytes;
-
-    currentShmOffset += req.bytes;
-  }
-
-  // 对齐 (Optional): currentShmOffset = (currentShmOffset + 7) & ~7;
-  long totalShmSize = currentShmOffset;
-
-  // ===========================================================================
-  // 步骤四：并行写入 (Parallel Write)
-  // ===========================================================================
-  // 申请/获取共享内存
-  mpiCom->allocateSharedMemoryWindow(_isProxy ? totalShmSize : 0);
-  char* basePtr = static_cast<char*>(mpiCom->getSharedMemoryPointer(0));
-
-  // 填充 Header (仅 Proxy)
-  if (_isProxy) {
-     SharedMemoryHeader* header = reinterpret_cast<SharedMemoryHeader*>(basePtr);
-     header->payloadSize = totalShmSize - sizeof(SharedMemoryHeader);
-     header->stateFlag = 1;
-  }
-
-  // Worker 写入数据
-  // 遍历排序后的列表，找到属于我的请求 (Source == MyGlobalRank)
-  // 这样避免了再去 Map 里查 Offset，直接线性扫描即可
-  for (const auto &req : allRequests) {
-    if (req.sourceRank == myGlobalRank) {
-      const Mapping* targetMapping = nullptr;
-      for (const auto &m : _mappings) {
-          if (static_cast<long>(m.remoteRank) == req.remoteRank) {
-              targetMapping = &m;
-              break;
-          }
-      }
-      if (targetMapping) {
-          double* destBuf = reinterpret_cast<double*>(basePtr + req.globalOffset);
-          // 拷贝数据 (Gather)
-          for (size_t i = 0; i < targetMapping->indices.size(); ++i) {
-              int vertexIndex = targetMapping->indices[i];
-              for (int d = 0; d < valueDimension; ++d) {
-                  destBuf[i * valueDimension + d] = itemsToSend[vertexIndex * valueDimension + d];
-              }
-          }
+  // Worker 并行写入
+  for (const auto& task : _workerSendTasks) {
+    for (size_t i = 0; i < task.count; ++i) {
+      int vertexIndex = task.indicesPtr[i];
+      for (int d = 0; d < valueDimension; ++d) {
+        // Copy User Data -> Shared Memory Window
+        task.shmPtr[i * valueDimension + d] = itemsToSend[vertexIndex * valueDimension + d];
       }
     }
   }
 
-  // 节点内同步：确保所有写入完成
   mpiCom->sharedMemoryBarrier();
 
-  // ===========================================================================
-  // 步骤五：代理聚合发送 (Proxy Aggregated Send)
-  // ===========================================================================
+  // Proxy 聚合发送
   if (_isProxy) {
-    for (auto const& [targetProxy, batch] : sendSchedule) {
-      if (batch.totalBytes > 0) {
-        double* sendBuf = reinterpret_cast<double*>(basePtr + batch.startOffset);
-
-        // 构造 Span 并发送
-        // 注意：targetProxy 是 long，需要转回 int
-        precice::span<double const> aggregatedSpan(sendBuf, batch.totalBytes / sizeof(double));
-        auto req = _communication->aSend(aggregatedSpan, static_cast<int>(targetProxy));
-        _ongoingRequests.push_back(std::move(req));
-      }
+    for (const auto& task : _proxySendTasks) {
+      double* sendBuf = reinterpret_cast<double*>(_sendBasePtr + task.shmOffset);
+      precice::span<double const> aggregatedSpan(sendBuf, task.totalDoubles);
+      _ongoingRequests.push_back(_communication->aSend(aggregatedSpan, task.targetRank));
     }
   }
 
-  // 结束本轮同步
   mpiCom->sharedMemoryBarrier();
 }
 
 void HierarchicalCommunication::receive(precice::span<double> itemsToReceive, int valueDimension)
 {
 
-  // 按照原版逻辑，先清零缓冲区（因为后面是 += 操作）
   std::fill(itemsToReceive.begin(), itemsToReceive.end(), 0.0);
 
   auto mpiCom = std::dynamic_pointer_cast<com::MPICommunication>(_communication);
   PRECICE_ASSERT(mpiCom, "Hierarchical communication requires MPI.");
 
-  // [安全关键] 在重新分配共享内存之前，必须确保上一轮（可能是 send）的异步请求已完成
   if (_isProxy) {
     waitAllOngoingRequests();
   }
-  // 节点内同步：防止 Worker 还在访问旧内存，或 Proxy 还没清理完
   mpiCom->sharedMemoryBarrier();
 
-  // 0. 确保路由表已建立
-  if (_remoteRankToProxy.empty()) {
-    exchangeTopology();
+  if (valueDimension != _cachedRecvDim) {
+      initializeRecvPattern(valueDimension);
   }
 
-  MPI_Comm localComm = mpiCom->getLocalCommunicator();
-  int localSize = mpiCom->getLocalSize();
-  int myGlobalRank = utils::IntraComm::getRank();
-
-  // ===========================================================================
-  // 步骤一：元数据申报 (Manifest)
-  // ===========================================================================
-  // 收集：[RemoteProxy, MyRank (Receiver), RemoteRank (Sender), Bytes]
-  // 注意：这里我们声明“我期望从哪里接收多少数据”
-  std::vector<long> myMeta;
-
-  for (const auto &mapping : _mappings) {
-    if (_remoteRankToProxy.find(mapping.remoteRank) == _remoteRankToProxy.end()) {
-        continue;
-    }
-
-    long remoteProxy = static_cast<long>(_remoteRankToProxy[mapping.remoteRank]);
-    long myRank      = static_cast<long>(myGlobalRank);
-    long remoteRank  = static_cast<long>(mapping.remoteRank);
-    long bytes       = static_cast<long>(mapping.indices.size() * valueDimension * sizeof(double));
-
-    if (bytes > 0) {
-      myMeta.push_back(remoteProxy);
-      myMeta.push_back(myRank);
-      myMeta.push_back(remoteRank);
-      myMeta.push_back(bytes);
-    }
-  }
-
-  // ===========================================================================
-  // 步骤二：全局交换 (Allgatherv - Intra-node)
-  // ===========================================================================
-  // 这一步是为了让 Proxy 知道整个节点需要从外部接收多少数据，并计算布局
-  std::vector<int> metaCounts(localSize);
-  int myMetaSize = static_cast<int>(myMeta.size());
-  MPI_Allgather(&myMetaSize, 1, MPI_INT, metaCounts.data(), 1, MPI_INT, localComm);
-
-  std::vector<int> metaDispls(localSize + 1, 0);
-  for (int i = 0; i < localSize; ++i) {
-    metaDispls[i + 1] = metaDispls[i] + metaCounts[i];
-  }
-  std::vector<long> globalMeta(metaDispls.back());
-
-  MPI_Allgatherv(myMeta.data(), myMetaSize, MPI_LONG,
-                 globalMeta.data(), metaCounts.data(), metaDispls.data(), MPI_LONG,
-                 localComm);
-
-  // ===========================================================================
-  // 步骤三：排序与调度 (Sort & Schedule)
-  // ===========================================================================
-  struct RequestEntry {
-    long remoteProxy; // The sender proxy
-    long myRank;      // Receiver rank (Me)
-    long remoteRank;  // Sender rank
-    long bytes;
-    long globalOffset;
-  };
-
-  std::vector<RequestEntry> allRequests;
-  allRequests.reserve(globalMeta.size() / 4);
-
-  for (size_t i = 0; i < globalMeta.size(); i += 4) {
-    allRequests.push_back({
-      globalMeta[i],     // remoteProxy
-      globalMeta[i+1],   // myRank
-      globalMeta[i+2],   // remoteRank
-      globalMeta[i+3],   // bytes
-      0                  // offset
-    });
-  }
-
-  // [关键] 确定性排序 - 必须与 Send 端的打包顺序完全匹配
-  // Send 端排序: TargetProxy (Msg) -> TargetRank (Receiver) -> SourceRank (Sender)
-  // Receive 端对应: RemoteProxy (Msg) -> MyRank (Receiver) -> RemoteRank (Sender)
-  std::sort(allRequests.begin(), allRequests.end(),
-    [](const RequestEntry &a, const RequestEntry &b) {
-      if (a.remoteProxy != b.remoteProxy) return a.remoteProxy < b.remoteProxy;
-      if (a.myRank != b.myRank)           return a.myRank < b.myRank;           // 对应 Send 端的 RemoteRank
-      return a.remoteRank < b.remoteRank;                                       // 对应 Send 端的 SourceRank
-    });
-
-  // 计算偏移量
-  long currentShmOffset = sizeof(SharedMemoryHeader);
-
-  // 接收计划：RemoteProxy -> {StartOffset, TotalBytes}
-  struct RecvBatch { long startOffset; long totalBytes; };
-  std::map<long, RecvBatch> recvSchedule;
-
-  for (auto &req : allRequests) {
-    req.globalOffset = currentShmOffset;
-
-    if (recvSchedule.find(req.remoteProxy) == recvSchedule.end()) {
-        recvSchedule[req.remoteProxy] = {currentShmOffset, 0};
-    }
-    recvSchedule[req.remoteProxy].totalBytes += req.bytes;
-
-    currentShmOffset += req.bytes;
-  }
-
-  long totalShmSize = currentShmOffset;
-
-  // ===========================================================================
-  // 步骤四：准备共享内存 (Allocation)
-  // ===========================================================================
-  // 此处会重置 Shared Memory，所以前面的 waitAllOngoingRequests 至关重要
-  mpiCom->allocateSharedMemoryWindow(_isProxy ? totalShmSize : 0);
-  char* basePtr = static_cast<char*>(mpiCom->getSharedMemoryPointer(0));
-
+  // Proxy 聚合接收
   if (_isProxy) {
-     SharedMemoryHeader* header = reinterpret_cast<SharedMemoryHeader*>(basePtr);
-     header->payloadSize = totalShmSize - sizeof(SharedMemoryHeader);
-     header->stateFlag = 0; // Reset state
-  }
+    std::vector<com::PtrRequest> currentRecvRequests;
 
-  // ===========================================================================
-  // 步骤五：代理接收 (Proxy Receive)
-  // ===========================================================================
-  // 此时 Proxy 负责将外部数据接收到 Shared Memory 中
-  if (_isProxy) {
-    std::vector<com::PtrRequest> recvRequests; // 本地暂存，这轮必须要等完
-
-    for (auto const& [remoteProxy, batch] : recvSchedule) {
-      if (batch.totalBytes > 0) {
-        double* recvBuf = reinterpret_cast<double*>(basePtr + batch.startOffset);
-
-        // 接收整个聚合包
-        precice::span<double> aggregatedSpan(recvBuf, batch.totalBytes / sizeof(double));
-
-        // 使用 aReceive 发起接收
-        auto req = _communication->aReceive(aggregatedSpan, static_cast<int>(remoteProxy));
-        recvRequests.push_back(std::move(req));
-      }
+    for (const auto& task : _proxyRecvTasks) {
+      double* recvBuf = reinterpret_cast<double*>(_recvBasePtr + task.shmOffset);
+      precice::span<double> aggregatedSpan(recvBuf, task.totalDoubles);
+      currentRecvRequests.push_back(_communication->aReceive(aggregatedSpan, task.targetRank));
     }
-
-    // [阻塞等待] 接收端必须拿到数据才能分发给 Worker，所以这里不能 defer
-    for (auto& req : recvRequests) {
+    for (auto& req : currentRecvRequests) {
         req->wait();
     }
   }
 
-  // 节点内同步：Worker 等待 Proxy 接收完成
   mpiCom->sharedMemoryBarrier();
 
-  // ===========================================================================
-  // 步骤六：本地分发 (Local Scatter / Read)
-  // ===========================================================================
-  // Worker 遍历请求列表，找到属于自己的数据并读取
-  for (const auto &req : allRequests) {
-    if (req.myRank == myGlobalRank) { // 这是发给我的数据
-      const Mapping* targetMapping = nullptr;
-
-      // 找到对应的 mapping (匹配 RemoteRank)
-      for (const auto &m : _mappings) {
-          if (static_cast<long>(m.remoteRank) == req.remoteRank) {
-              targetMapping = &m;
-              break;
-          }
-      }
-
-      if (targetMapping) {
-          double* srcBuf = reinterpret_cast<double*>(basePtr + req.globalOffset);
-
-          // 从共享内存读取并累加/赋值到 itemsToReceive
-          // 注意：send 端是按 mapping.indices 顺序写入的，这里按相同顺序读出即可
-          for (size_t i = 0; i < targetMapping->indices.size(); ++i) {
-              int vertexIndex = targetMapping->indices[i];
-              for (int d = 0; d < valueDimension; ++d) {
-                  // 这里遵循原版逻辑使用 +=，虽然前面已经 fill 0.0
-                  // 如果原意是累加（处理多重映射），这样写是安全的
-                  itemsToReceive[vertexIndex * valueDimension + d] += srcBuf[i * valueDimension + d];
-              }
-          }
+  // Worker 并行读取
+  for (const auto& task : _workerRecvTasks) {
+    for (size_t i = 0; i < task.count; ++i) {
+      int vertexIndex = task.indicesPtr[i];
+      for (int d = 0; d < valueDimension; ++d) {
+        itemsToReceive[vertexIndex * valueDimension + d] += task.shmPtr[i * valueDimension + d];
       }
     }
   }
 
-  // 结束同步：确保所有 Worker 读完数据前，Shared Memory 不被释放/重用
   mpiCom->sharedMemoryBarrier();
 }
 
@@ -1064,32 +765,6 @@ void HierarchicalCommunication::checkBufferedRequests(bool blocking)
     if (blocking)
       std::this_thread::yield(); // give up our time slice, so MPI may work
   } while (blocking);
-}
-
-std::pair<long, long> HierarchicalCommunication::computeLayout(long myItemCount, MPI_Comm localComm)
-{
-  // 1. 收集所有人的数据量
-  // _localSize 是节点内进程总数，在构造或 split 时已获取
-  std::vector<long> allCounts(_localSize);
-  long myCount = myItemCount;
-
-  // MPI_Allgather 让每个人都获得这就个数组 [10, 5, 20]
-  MPI_Allgather(&myCount, 1, MPI_LONG,
-                allCounts.data(), 1, MPI_LONG,
-                localComm);
-
-  // 2. 计算前缀和 (Prefix Sum)
-  long totalCount = 0;
-  long myOffsetCount = 0;
-
-  for (int i = 0; i < _localSize; ++i) {
-    if (i == _localRank) {
-      myOffsetCount = totalCount; // 轮到我之前的累加值就是我的偏移量
-    }
-    totalCount += allCounts[i];
-  }
-
-  return {myOffsetCount, totalCount};
 }
 
 void HierarchicalCommunication::exchangeTopology()
@@ -1167,10 +842,343 @@ void HierarchicalCommunication::waitAllOngoingRequests()
   if (!_ongoingRequests.empty()) {
     // 只有 Proxy 会有这些请求
     for (auto& req : _ongoingRequests) {
-      req->wait(); // 阻塞等待 MPI 完成数据读取
+      req->wait();
     }
     _ongoingRequests.clear();
   }
 }
 
+void HierarchicalCommunication::initializeSendPattern(int valueDimension)
+{
+  // 1. 清理旧资源 (防止内存泄漏或窗口重叠)
+  freeSendWindow();
+
+  auto mpiCom = std::dynamic_pointer_cast<com::MPICommunication>(_communication);
+  PRECICE_ASSERT(mpiCom, "Hierarchical communication requires MPI.");
+
+  MPI_Comm localComm = mpiCom->getLocalCommunicator();
+  int localSize = mpiCom->getLocalSize();
+  int myGlobalRank = utils::IntraComm::getRank();
+
+  // 2. 确保拓扑信息已建立
+  if (_remoteRankToProxy.empty()) {
+    exchangeTopology();
+  }
+
+  // ===========================================================================
+  // 步骤一：构建与交换元数据 (Metadata)
+  // ===========================================================================
+
+  // 1.1 收集本地发送需求
+  // 格式: [TargetProxy, RemoteRank, SourceRank, Bytes]
+  std::vector<long> mySendMeta;
+  for (const auto &mapping : _mappings) {
+    // 过滤掉未知的远程 Rank
+    if (_remoteRankToProxy.find(mapping.remoteRank) == _remoteRankToProxy.end()) {
+        continue;
+    }
+
+    long bytes = static_cast<long>(mapping.indices.size() * valueDimension * sizeof(double));
+    if (bytes > 0) {
+      mySendMeta.push_back(_remoteRankToProxy[mapping.remoteRank]); // TargetProxy (聚合目标)
+      mySendMeta.push_back(mapping.remoteRank);                     // RemoteRank (最终目的地)
+      mySendMeta.push_back(myGlobalRank);                           // SourceRank (我)
+      mySendMeta.push_back(bytes);
+    }
+  }
+
+  // 1.2 节点内全收集 (Allgatherv)
+  std::vector<int> counts(localSize);
+  int mySize = static_cast<int>(mySendMeta.size());
+  MPI_Allgather(&mySize, 1, MPI_INT, counts.data(), 1, MPI_INT, localComm);
+
+  std::vector<int> displs(localSize + 1, 0);
+  for (int i = 0; i < localSize; ++i) {
+    displs[i + 1] = displs[i] + counts[i];
+  }
+  std::vector<long> globalMeta(displs.back());
+
+  MPI_Allgatherv(mySendMeta.data(), mySize, MPI_LONG,
+                 globalMeta.data(), counts.data(), displs.data(), MPI_LONG,
+                 localComm);
+
+  // ===========================================================================
+  // 步骤二：排序与布局计算
+  // ===========================================================================
+
+  // 2.1 解析为结构体以便排序
+  struct ReqEntry {
+      long target;
+      long remote;
+      long source;
+      long bytes;
+      long offset;
+  };
+  std::vector<ReqEntry> requests;
+  requests.reserve(globalMeta.size() / 4);
+
+  for (size_t i = 0; i < globalMeta.size(); i += 4) {
+    requests.push_back({globalMeta[i], globalMeta[i+1], globalMeta[i+2], globalMeta[i+3], 0});
+  }
+
+  // 2.2 确定性排序 (关键)
+  // 必须保证所有进程算出的 offset 顺序一致
+  // 优先级: TargetProxy -> RemoteRank -> SourceRank
+  std::sort(requests.begin(), requests.end(), [](const ReqEntry &a, const ReqEntry &b) {
+      if (a.target != b.target) return a.target < b.target;
+      if (a.remote != b.remote) return a.remote < b.remote;
+      return a.source < b.source;
+  });
+
+  // 2.3 计算内存偏移量 & 生成 Proxy 任务
+  long currentOffset = sizeof(SharedMemoryHeader); // 预留 Header 空间
+
+  for (auto &req : requests) {
+    req.offset = currentOffset;
+
+    // 如果我是 Proxy，记录聚合发送任务
+    // 逻辑：只要 Target 变了，就是新的一批聚合包
+    if (_proxySendTasks.empty() || _proxySendTasks.back().targetRank != req.target) {
+        _proxySendTasks.push_back({static_cast<int>(req.target), currentOffset, 0});
+    }
+    _proxySendTasks.back().totalDoubles += req.bytes / sizeof(double);
+
+    currentOffset += req.bytes;
+  }
+
+  // 内存对齐 (8字节对齐)，虽然这里不是必须的，但为了性能是个好习惯
+  long totalSize = (currentOffset + 7) & ~7;
+
+  // ===========================================================================
+  // 步骤三：申请独立的共享窗口 (Send Window)
+  // ===========================================================================
+
+  MPI_Info winInfo;
+  MPI_Info_create(&winInfo);
+  MPI_Info_set(winInfo, "alloc_shared_noncontig", "true"); // 允许非连续内存优化
+
+  // 只有 Proxy 申请实际物理内存，Worker 申请大小为 0
+  MPI_Aint size = _isProxy ? totalSize : 0;
+  int ret = MPI_Win_allocate_shared(size, sizeof(char), winInfo, localComm, &_sendBasePtr, &_winSend);
+  PRECICE_ASSERT(ret == MPI_SUCCESS, "MPI_Win_allocate_shared failed for Send Window");
+  MPI_Info_free(&winInfo);
+
+  // Worker 需要查询 Proxy (Rank 0) 的地址
+  if (!_isProxy) {
+      MPI_Aint sz;
+      int dsp;
+      // 查询 Rank 0 在 _winSend 上的地址
+      MPI_Win_shared_query(_winSend, 0, &sz, &dsp, &_sendBasePtr);
+  }
+
+  // 3.1 初始化 Header (仅 Proxy)
+  if (_isProxy && _sendBasePtr) {
+      SharedMemoryHeader* header = reinterpret_cast<SharedMemoryHeader*>(_sendBasePtr);
+      header->payloadSize = totalSize - sizeof(SharedMemoryHeader);
+      header->stateFlag = 0; // 初始化状态
+  }
+  // 确保内存分配完成且 Header 可见
+  MPI_Win_fence(0, _winSend);
+
+  // ===========================================================================
+  // 步骤四：缓存 Worker 任务 (预计算指针)
+  // ===========================================================================
+
+  for (const auto &req : requests) {
+    // 如果这条请求是我发起的 (Source == Me)
+    if (req.source == myGlobalRank) {
+      // 查找对应的 mapping 以获取 indices
+      for (const auto &m : _mappings) {
+          if (static_cast<long>(m.remoteRank) == req.remote) {
+              _workerSendTasks.push_back({
+                  reinterpret_cast<double*>(_sendBasePtr + req.offset), // 绝对物理地址
+                  m.indices.data(),
+                  m.indices.size()
+              });
+              break;
+          }
+      }
+    }
+  }
+
+  _cachedSendDim = valueDimension;
+  MPI_Barrier(localComm);
+}
+
+void HierarchicalCommunication::initializeRecvPattern(int valueDimension)
+{
+  // 1. 清理旧资源 (关键：防止窗口重叠或泄漏)
+  freeRecvWindow();
+
+  auto mpiCom = std::dynamic_pointer_cast<com::MPICommunication>(_communication);
+  PRECICE_ASSERT(mpiCom, "Hierarchical communication requires MPI.");
+
+  MPI_Comm localComm = mpiCom->getLocalCommunicator();
+  int localSize = mpiCom->getLocalSize();
+  int myGlobalRank = utils::IntraComm::getRank();
+
+  // 2. 确保拓扑信息已建立
+  if (_remoteRankToProxy.empty()) {
+    exchangeTopology();
+  }
+
+  // ===========================================================================
+  // 步骤一：构建与交换元数据 (Metadata)
+  // ===========================================================================
+
+  // 1.1 收集本地接收需求
+  // 格式: [RemoteProxy, MyRank(Receiver), RemoteRank(Sender), Bytes]
+  // 注意：这里的 RemoteProxy 是对方的 Proxy（即数据的来源聚合点）
+  std::vector<long> myRecvMeta;
+  for (const auto &mapping : _mappings) {
+    if (_remoteRankToProxy.find(mapping.remoteRank) == _remoteRankToProxy.end()) {
+        continue;
+    }
+    long bytes = static_cast<long>(mapping.indices.size() * valueDimension * sizeof(double));
+    if (bytes > 0) {
+      myRecvMeta.push_back(_remoteRankToProxy[mapping.remoteRank]); // RemoteProxy (Sender Proxy)
+      myRecvMeta.push_back(myGlobalRank);                           // MyRank (Receiver)
+      myRecvMeta.push_back(mapping.remoteRank);                     // RemoteRank (Sender)
+      myRecvMeta.push_back(bytes);
+    }
+  }
+
+  // 1.2 节点内全收集 (Allgatherv)
+  std::vector<int> counts(localSize);
+  int mySize = static_cast<int>(myRecvMeta.size());
+  MPI_Allgather(&mySize, 1, MPI_INT, counts.data(), 1, MPI_INT, localComm);
+
+  std::vector<int> displs(localSize + 1, 0);
+  for (int i = 0; i < localSize; ++i) {
+    displs[i + 1] = displs[i] + counts[i];
+  }
+  std::vector<long> globalMeta(displs.back());
+
+  MPI_Allgatherv(myRecvMeta.data(), mySize, MPI_LONG,
+                 globalMeta.data(), counts.data(), displs.data(), MPI_LONG,
+                 localComm);
+
+  // ===========================================================================
+  // 步骤二：排序与布局计算
+  // ===========================================================================
+
+  // 2.1 解析为结构体
+  struct RecvReqEntry {
+    long remoteProxy;
+    long myRank;
+    long remoteRank;
+    long bytes;
+    long offset;
+  };
+
+  std::vector<RecvReqEntry> requests;
+  requests.reserve(globalMeta.size() / 4);
+  for (size_t i = 0; i < globalMeta.size(); i += 4) {
+    requests.push_back({globalMeta[i], globalMeta[i+1], globalMeta[i+2], globalMeta[i+3], 0});
+  }
+
+  // 2.2 确定性排序 (关键)
+  // 排序必须与发送端 (SendPattern) 的逻辑对应，以确保逻辑清晰
+  // 优先级: RemoteProxy -> MyRank (Receiver) -> RemoteRank (Sender)
+  std::sort(requests.begin(), requests.end(),
+    [](const RecvReqEntry &a, const RecvReqEntry &b) {
+      if (a.remoteProxy != b.remoteProxy) return a.remoteProxy < b.remoteProxy;
+      if (a.myRank != b.myRank)           return a.myRank < b.myRank;
+      return a.remoteRank < b.remoteRank;
+    });
+
+  // 2.3 计算内存偏移量 & 生成 Proxy 任务
+  long currentOffset = sizeof(SharedMemoryHeader);
+
+  for (auto &req : requests) {
+    req.offset = currentOffset;
+
+    // 如果我是 Proxy，记录聚合接收任务
+    // 逻辑：只要 RemoteProxy 变了，就是来自不同节点的一批新数据
+    if (_proxyRecvTasks.empty() || _proxyRecvTasks.back().targetRank != req.remoteProxy) {
+        _proxyRecvTasks.push_back({static_cast<int>(req.remoteProxy), currentOffset, 0});
+    }
+    _proxyRecvTasks.back().totalDoubles += req.bytes / sizeof(double);
+
+    currentOffset += req.bytes;
+  }
+
+  // 内存对齐
+  long totalSize = (currentOffset + 7) & ~7;
+
+  // ===========================================================================
+  // 步骤三：申请独立的共享窗口 (Recv Window)
+  // ===========================================================================
+
+  MPI_Info winInfo;
+  MPI_Info_create(&winInfo);
+  MPI_Info_set(winInfo, "alloc_shared_noncontig", "true");
+
+  // 只有 Proxy 申请实际大小
+  MPI_Aint size = _isProxy ? totalSize : 0;
+  // [关键] 申请 _winRecv 并获取本地指针 _recvBasePtr
+  int ret = MPI_Win_allocate_shared(size, sizeof(char), winInfo, localComm, &_recvBasePtr, &_winRecv);
+  PRECICE_ASSERT(ret == MPI_SUCCESS, "MPI_Win_allocate_shared failed for Recv Window");
+  MPI_Info_free(&winInfo);
+
+  // Worker 查询地址
+  if (!_isProxy) {
+      MPI_Aint sz;
+      int dsp;
+      MPI_Win_shared_query(_winRecv, 0, &sz, &dsp, &_recvBasePtr);
+  }
+
+  // 初始化 Header (仅 Proxy)
+  if (_isProxy && _recvBasePtr) {
+      SharedMemoryHeader* header = reinterpret_cast<SharedMemoryHeader*>(_recvBasePtr);
+      header->payloadSize = totalSize - sizeof(SharedMemoryHeader);
+      header->stateFlag = 0;
+  }
+  // 确保内存分配完成
+  MPI_Win_fence(0, _winRecv);
+
+  // ===========================================================================
+  // 步骤四：缓存 Worker 任务 (预计算指针)
+  // ===========================================================================
+
+  for (const auto &req : requests) {
+    // 如果这条请求是发给我的 (MyRank == Me)
+    if (req.myRank == myGlobalRank) {
+      // 查找对应的 mapping
+      for (const auto &m : _mappings) {
+          if (static_cast<long>(m.remoteRank) == req.remoteRank) {
+              _workerRecvTasks.push_back({
+                  reinterpret_cast<double*>(_recvBasePtr + req.offset), // 绝对物理地址
+                  m.indices.data(),
+                  m.indices.size()
+              });
+              break;
+          }
+      }
+    }
+  }
+
+  _cachedRecvDim = valueDimension;
+  MPI_Barrier(localComm);
+}
+
+void HierarchicalCommunication::freeSendWindow() {
+  if (_winSend != MPI_WIN_NULL) {
+    MPI_Win_free(&_winSend);
+    _winSend = MPI_WIN_NULL;
+    _sendBasePtr = nullptr;
+  }
+  _proxySendTasks.clear();
+  _workerSendTasks.clear();
+}
+
+void HierarchicalCommunication::freeRecvWindow() {
+  if (_winRecv != MPI_WIN_NULL) {
+    MPI_Win_free(&_winRecv);
+    _winRecv = MPI_WIN_NULL;
+    _recvBasePtr = nullptr;
+  }
+  _proxyRecvTasks.clear();
+  _workerRecvTasks.clear();
+}
 } // namespace precice::m2n

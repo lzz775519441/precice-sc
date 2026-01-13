@@ -193,21 +193,7 @@ void ReceivedPartition::compute()
       }
     }
 
-    // ================== [开始插入代码] ==================
-    // 打印当前进程(Rank)对应的所有 remoteRank (即 _mappings 的 Key)
-    std::cout << "Process Rank " << utils::IntraComm::getRank() 
-              << " on Mesh \"" << _mesh->getName() << "\" has mappings to Remote Ranks: ";
-    
-    if (_mesh->getCommunicationMap().empty()) {
-        std::cout << "None";
-    } else {
-        for (const auto& [remoteRank, vertices] : _mesh->getCommunicationMap()) {
-            std::cout << remoteRank << " (count: " << vertices.size() << ") ";
-        }
-    }
-    std::cout << std::endl;
-    // ================== [结束插入代码] ==================
-    
+
     // communicate remote communication map to all remote connected ranks
     m2n().scatterAllCommunicationMap(remoteCommunicationMap, *_mesh);
 
