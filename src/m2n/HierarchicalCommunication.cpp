@@ -856,14 +856,15 @@ void HierarchicalCommunication::initializeSendPattern(int valueDimension)
   auto mpiCom = std::dynamic_pointer_cast<com::MPICommunication>(_communication);
   PRECICE_ASSERT(mpiCom, "Hierarchical communication requires MPI.");
 
-  MPI_Comm localComm = mpiCom->getLocalCommunicator();
-  int localSize = mpiCom->getLocalSize();
-  int myGlobalRank = utils::IntraComm::getRank();
-
   // 2. 确保拓扑信息已建立
   if (_remoteRankToProxy.empty()) {
     exchangeTopology();
   }
+
+  MPI_Comm localComm = mpiCom->getLocalCommunicator();
+  int localSize = mpiCom->getLocalSize();
+  int myGlobalRank = utils::IntraComm::getRank();
+
 
   // ===========================================================================
   // 步骤一：构建与交换元数据 (Metadata)
@@ -1013,14 +1014,15 @@ void HierarchicalCommunication::initializeRecvPattern(int valueDimension)
   auto mpiCom = std::dynamic_pointer_cast<com::MPICommunication>(_communication);
   PRECICE_ASSERT(mpiCom, "Hierarchical communication requires MPI.");
 
-  MPI_Comm localComm = mpiCom->getLocalCommunicator();
-  int localSize = mpiCom->getLocalSize();
-  int myGlobalRank = utils::IntraComm::getRank();
-
   // 2. 确保拓扑信息已建立
   if (_remoteRankToProxy.empty()) {
     exchangeTopology();
   }
+
+  MPI_Comm localComm = mpiCom->getLocalCommunicator();
+  int localSize = mpiCom->getLocalSize();
+  int myGlobalRank = utils::IntraComm::getRank();
+
 
   // ===========================================================================
   // 步骤一：构建与交换元数据 (Metadata)
