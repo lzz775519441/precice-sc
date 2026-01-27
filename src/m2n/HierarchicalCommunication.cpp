@@ -13,7 +13,6 @@
 #include <cstring>
 #include "m2n/HierarchicalCommunication.hpp"
 #include "com/MPICommunication.hpp"
-#include "m2n/SharedMemoryHeader.hpp"
 #include <numeric>
 
 #include "com/Communication.hpp"
@@ -325,9 +324,6 @@ HierarchicalCommunication::HierarchicalCommunication(com::PtrCommunicationFactor
 HierarchicalCommunication::~HierarchicalCommunication()
 {
   PRECICE_TRACE(_isConnected);
-  waitAllOngoingRequests();
-  freeSendWindow();
-  freeRecvWindow();
   closeConnection();
 }
 
@@ -614,6 +610,8 @@ void HierarchicalCommunication::closeConnection()
   waitAllOngoingRequests();
   checkBufferedRequests(true);
 
+  freeSendWindow();
+  freeRecvWindow();
   _communication.reset();
   _mappings.clear();
   _connectionDataVector.clear();
@@ -655,8 +653,6 @@ void HierarchicalCommunication::send(precice::span<double const> itemsToSend, in
       _ongoingRequests.push_back(_communication->aSend(aggregatedSpan, task.targetRank));
     }
   }
-
-  mpiCom->sharedMemoryBarrier();
 }
 
 void HierarchicalCommunication::receive(precice::span<double> itemsToReceive, int valueDimension)
@@ -829,13 +825,6 @@ void HierarchicalCommunication::exchangeTopology()
   mpiCom->sharedMemoryBarrier();
 }
 
-void HierarchicalCommunication::cleanupRequests() {
-  // 移除已经完成的请求
-  _ongoingRequests.erase(
-    std::remove_if(_ongoingRequests.begin(), _ongoingRequests.end(),
-      [](const com::PtrRequest& req) { return req->test(); }), // test() 返回 true 表示已完成
-    _ongoingRequests.end());
-}
 
 void HierarchicalCommunication::waitAllOngoingRequests()
 {
@@ -932,7 +921,7 @@ void HierarchicalCommunication::initializeSendPattern(int valueDimension)
   });
 
   // 2.3 计算内存偏移量 & 生成 Proxy 任务
-  long currentOffset = sizeof(SharedMemoryHeader); // 预留 Header 空间
+  long currentOffset = 0; // 直接从头开始存数据
 
   for (auto &req : requests) {
     req.offset = currentOffset;
@@ -972,14 +961,6 @@ void HierarchicalCommunication::initializeSendPattern(int valueDimension)
       MPI_Win_shared_query(_winSend, 0, &sz, &dsp, &_sendBasePtr);
   }
 
-  // 3.1 初始化 Header (仅 Proxy)
-  if (_isProxy && _sendBasePtr) {
-      SharedMemoryHeader* header = reinterpret_cast<SharedMemoryHeader*>(_sendBasePtr);
-      header->payloadSize = totalSize - sizeof(SharedMemoryHeader);
-      header->stateFlag = 0; // 初始化状态
-  }
-  // 确保内存分配完成且 Header 可见
-  MPI_Win_fence(0, _winSend);
 
   // ===========================================================================
   // 步骤四：缓存 Worker 任务 (预计算指针)
@@ -1003,7 +984,6 @@ void HierarchicalCommunication::initializeSendPattern(int valueDimension)
   }
 
   _cachedSendDim = valueDimension;
-  MPI_Barrier(localComm);
 }
 
 void HierarchicalCommunication::initializeRecvPattern(int valueDimension)
@@ -1090,7 +1070,7 @@ void HierarchicalCommunication::initializeRecvPattern(int valueDimension)
     });
 
   // 2.3 计算内存偏移量 & 生成 Proxy 任务
-  long currentOffset = sizeof(SharedMemoryHeader);
+  long currentOffset = 0; // 直接从头开始存数据
 
   for (auto &req : requests) {
     req.offset = currentOffset;
@@ -1130,14 +1110,6 @@ void HierarchicalCommunication::initializeRecvPattern(int valueDimension)
       MPI_Win_shared_query(_winRecv, 0, &sz, &dsp, &_recvBasePtr);
   }
 
-  // 初始化 Header (仅 Proxy)
-  if (_isProxy && _recvBasePtr) {
-      SharedMemoryHeader* header = reinterpret_cast<SharedMemoryHeader*>(_recvBasePtr);
-      header->payloadSize = totalSize - sizeof(SharedMemoryHeader);
-      header->stateFlag = 0;
-  }
-  // 确保内存分配完成
-  MPI_Win_fence(0, _winRecv);
 
   // ===========================================================================
   // 步骤四：缓存 Worker 任务 (预计算指针)
@@ -1161,7 +1133,6 @@ void HierarchicalCommunication::initializeRecvPattern(int valueDimension)
   }
 
   _cachedRecvDim = valueDimension;
-  MPI_Barrier(localComm);
 }
 
 void HierarchicalCommunication::freeSendWindow() {

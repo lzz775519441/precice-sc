@@ -202,7 +202,6 @@ private:
   void exchangeTopology();
 
   std::vector<com::PtrRequest> _ongoingRequests;
-  void cleanupRequests();
   void waitAllOngoingRequests();
 
   // 定义任务结构体 (Send/Recv 通用)
