@@ -12,7 +12,6 @@
 #include "logging/Logger.hpp"
 #include "mesh/Mesh.hpp"
 #include "mesh/SharedPointer.hpp"
-#include "m2n/SharedMemoryHeader.hpp"
 #include "com/MPICommunication.hpp"
 #include <map>
 #include <mpi.h>
