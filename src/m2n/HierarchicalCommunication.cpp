@@ -697,8 +697,6 @@ void HierarchicalCommunication::receive(precice::span<double> itemsToReceive, in
       }
     }
   }
-
-  mpiCom->sharedMemoryBarrier();
 }
 
 void HierarchicalCommunication::broadcastSend(int itemToSend)
