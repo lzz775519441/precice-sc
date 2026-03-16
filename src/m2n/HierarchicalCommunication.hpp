@@ -12,7 +12,6 @@
 #include "logging/Logger.hpp"
 #include "mesh/Mesh.hpp"
 #include "mesh/SharedPointer.hpp"
-#include "com/MPICommunication.hpp"
 #include <map>
 #include <mpi.h>
 
@@ -193,12 +192,13 @@ private:
   bool _isProxy = false;
   int  _localRank = -1;
   int  _localSize = -1;
+  MPI_Comm _localComm = MPI_COMM_NULL;
 
   // 路由表：远程 Rank -> 远程 Proxy Rank
   std::map<int, int> _remoteRankToProxy;
 
   // 辅助函数：执行拓扑交换
-  void exchangeTopology();
+  void setupLocalTopology();
 
   std::vector<com::PtrRequest> _ongoingRequests;
   void waitAllOngoingRequests();
